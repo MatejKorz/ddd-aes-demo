@@ -2,6 +2,7 @@
     MIT license
     SPDX-License-Identifier: MIT
 */
+#define _GNU_SOURCE
 
 #include <assert.h>
 #include <stdio.h>
@@ -50,52 +51,84 @@ int main(int argc, char* argv[])
     uint8_t input_buff[BLOCK_SIZE] = { 0 };
     uint8_t output_buff[BLOCK_SIZE] = { 0 };
 
-    int fd = open("input.bin", O_RDWR);
-    if (fd < 0) {
+    const char* input_filename = "input.bin";
+    const char* tmp_filename = "input.bin.tmp";
+
+    int fd_in = open(input_filename, O_RDWR | O_CLOEXEC);
+    if (fd_in < 0) {
         perror("open input file");
         return 1;
     }
 
+    int fd_out = open(".", O_WRONLY | O_TMPFILE, 0644);
+    if (fd_out < 0) {
+        perror("open temporary output file");
+        close(fd_in);
+        return 1;
+    }
+
+    int success = 1;
     for (uint64_t iv = 0; iv < BLOCK_COUNT; iv++) {
         memset(tweak, 0, TWEAKSIZE_BYTES);
         uint64_t iv_le = htole64(iv);
         memcpy(tweak, &iv_le, sizeof(iv_le));
 
         off_t offset = (off_t)(iv * BLOCK_SIZE);
-        ssize_t rbytes = pread(fd, input_buff, BLOCK_SIZE, offset);
+        ssize_t rbytes = pread(fd_in, input_buff, BLOCK_SIZE, offset);
         if (rbytes < 0) {
             perror("pread");
-            return 1;
+            success = 0;
+            break;
         }
         if (rbytes == 0) {
             break;
         }
 
+        size_t ebytes = (size_t)rbytes;
         int status;
         switch (mode) {
             case MODE_ENCRYPT:
                 status =
-                  ddd_aes_ref_read_encrypt(output_buff, input_buff, BLOCK_SIZE, key_k, key_l, tweak, TWEAKSIZE_BYTES);
+                  ddd_aes_ref_read_encrypt(output_buff, input_buff, ebytes, key_k, key_l, tweak, TWEAKSIZE_BYTES);
                 break;
             case MODE_DECRYPT:
                 status =
-                  ddd_aes_ref_read_decrypt(output_buff, input_buff, BLOCK_SIZE, key_k, key_l, tweak, TWEAKSIZE_BYTES);
+                  ddd_aes_ref_read_decrypt(output_buff, input_buff, ebytes, key_k, key_l, tweak, TWEAKSIZE_BYTES);
                 break;
             default:
                 status = -1;
         }
+        memset(input_buff, 0, BLOCK_SIZE);
 
         if (status < 0) {
             fprintf(stderr, "ERROR: ddd_aes_ref_read failed, status: %d\n", status);
-            return 1;
+            success = 0;
+            break;
         }
 
-        ssize_t wbytes = pwrite(fd, output_buff, (size_t)rbytes, offset);
+        ssize_t wbytes = pwrite(fd_out, output_buff, ebytes, offset);
+        memset(output_buff, 0, BLOCK_SIZE);
         if (wbytes != rbytes) {
             perror("pwrite");
-            return 1;
+            success = 0;
+            break;
         }
     }
 
-    return 0;
+    if (success) {
+        if (linkat(fd_out, "", AT_FDCWD, tmp_filename, AT_EMPTY_PATH) < 0) {
+            perror("linkat");
+            success = 0;
+        }
+        else if (rename(tmp_filename, input_filename) < 0) {
+            perror("rename");
+            unlink(tmp_filename);
+            success = 0;
+        }
+    }
+
+    close(fd_in);
+    close(fd_out);
+
+    return success ? 0 : 1;
 }
